@@ -48,6 +48,11 @@ from .configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
 
+class DDModelOutputWithPast(BaseModelOutputWithPast):
+    def __init__(self, last_hidden_state, past_key_values=None, hidden_states=None, attentions=None, router_weights=None, router_masks=None):
+        super().__init__(last_hidden_state=last_hidden_state, past_key_values=past_key_values, hidden_states=hidden_states, attentions=attentions)
+        self.router_weights = router_weights
+        self.router_masks = router_masks
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -155,6 +160,34 @@ class LlamaMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
+class LlamaRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.router_enc = nn.Linear(config.hidden_size, config.hidden_size // config.router_reduction_factor, bias=config.mlp_bias)
+        self.router_norm = LlamaRMSNorm(config.hidden_size // config.router_reduction_factor, eps=config.rms_norm_eps)
+        self.router_act = nn.Tanh()
+        self.router_dec = nn.Linear(config.hidden_size // config.router_reduction_factor, config.hidden_size, bias=config.mlp_bias)
+        self.router_head = nn.Linear(config.hidden_size, 1, bias=config.mlp_bias)
+
+    def forward(self, hidden_states):
+        router_logits = self.router_head(self.router_dec(self.router_act(self.router_norm(self.router_enc(hidden_states)))))
+        return router_logits
+
+class LlamaProj(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size // config.router_reduction_factor, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.hidden_size, self.intermediate_size // config.router_reduction_factor, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.intermediate_size // config.router_reduction_factor, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        up_proj = self.up_proj(self.act_fn(self.gate_proj(x)) * self.down_proj(x))
+        return up_proj
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -270,10 +303,15 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
 
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
-
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Add routing support
+        self.routing = layer_idx in config.routing_layers
+        if self.routing:
+            self.router = LlamaRouter(config)
+            self.router_proj = LlamaProj(config)
 
     def forward(
         self,
@@ -283,11 +321,20 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+    ) -> tuple:
+        router_mask = None
+        router_weights = None
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        
+        if self.routing:
+            router_logits = self.router(hidden_states)
+            router_weights = torch.sigmoid(router_logits)
+            router_mask = (router_weights > 0.5).to(hidden_states.dtype)
+
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -299,14 +346,27 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+
+        if self.routing:
+            hidden_states = residual + hidden_states * router_mask
+        else:
+            hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+
+        if self.routing:
+            preserved_hidden_states = self.mlp(hidden_states) * router_mask * router_weights
+            skipped_hidden_states = self.router_proj(hidden_states) * (1-router_mask) * (1-router_weights)
+            hidden_states = residual + preserved_hidden_states + skipped_hidden_states
+            router_weights = router_weights.squeeze(-1)
+            router_mask = router_mask.squeeze(-1)
+        else:
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        return (hidden_states, router_weights, router_mask)
 
 
 @auto_docstring
@@ -358,7 +418,8 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
+    ) -> DDModelOutputWithPast:  # Changed return type
+        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -388,9 +449,11 @@ class LlamaModel(LlamaPreTrainedModel):
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_router_weights = ()  # Add this
+        all_router_masks = ()     # Add this
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+            hidden_states, router_weights, router_mask = decoder_layer(  # Updated unpacking
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
@@ -399,11 +462,16 @@ class LlamaModel(LlamaPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            if decoder_layer.routing:  # Add this
+                all_router_weights += (router_weights,)
+                all_router_masks += (router_mask,)
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
+        return DDModelOutputWithPast(  # Changed return
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            router_weights=all_router_weights,
+            router_masks=all_router_masks,
         )
 
 
@@ -454,7 +522,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs: BaseModelOutputWithPast = self.model(
+        outputs: DDModelOutputWithPast = self.model(  # Changed type hint
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -466,13 +534,29 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        # Add router penalty loss
+        router_weights = outputs.router_weights
+        router_masks = outputs.router_masks
+        if len(router_weights) > 0:
+            router_weights = [weight.to(hidden_states.device) for weight in router_weights]
+            router_weights = torch.stack(router_weights, dim=-1).float()
+
+            router_masks = [mask.to(hidden_states.device) for mask in router_masks]
+            router_masks = torch.stack(router_masks, dim=-1).float()
+
+            if self.training and labels is not None:
+                shift_router_weights = router_weights[:, :-1, :].contiguous()
+                shift_router_weights = shift_router_weights.view(-1, shift_router_weights.shape[-1])
+                router_penalty_loss = torch.sum(shift_router_weights, dim=1)
+                router_penalty_loss = 1e-4 * torch.mean((router_penalty_loss) ** 2)
+                loss += router_penalty_loss
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -481,7 +565,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
 
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...
 
