@@ -182,6 +182,8 @@ class LlamaConfig(PreTrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        routing_layers=None,           # List of layer indices where routing is applied
+        router_reduction_factor=16,    # Bottleneck reduction factor for router
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -211,6 +213,8 @@ class LlamaConfig(PreTrainedConfig):
         # BC: if there is a 'type' field, copy it it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+        self.routing_layers = routing_layers if routing_layers is not None else []
+        self.router_reduction_factor = router_reduction_factor
         rope_config_validation(self)
 
         super().__init__(
