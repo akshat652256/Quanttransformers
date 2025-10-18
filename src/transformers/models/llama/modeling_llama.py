@@ -23,6 +23,9 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+import copy
+from torchao.quantization import quantize_, int8_weight_only
+
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -174,20 +177,20 @@ class LlamaRouter(nn.Module):
         router_logits = self.router_head(self.router_dec(self.router_act(self.router_norm(self.router_enc(hidden_states)))))
         return router_logits
 
-class LlamaProj(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size // config.router_reduction_factor, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.hidden_size, self.intermediate_size // config.router_reduction_factor, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.intermediate_size // config.router_reduction_factor, self.hidden_size, bias=config.mlp_bias)
-        self.act_fn = ACT2FN[config.hidden_act]
+# class LlamaProj(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size // config.router_reduction_factor, bias=config.mlp_bias)
+#         self.down_proj = nn.Linear(self.hidden_size, self.intermediate_size // config.router_reduction_factor, bias=config.mlp_bias)
+#         self.up_proj = nn.Linear(self.intermediate_size // config.router_reduction_factor, self.hidden_size, bias=config.mlp_bias)
+#         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        up_proj = self.up_proj(self.act_fn(self.gate_proj(x)) * self.down_proj(x))
-        return up_proj
+#     def forward(self, x):
+#         up_proj = self.up_proj(self.act_fn(self.gate_proj(x)) * self.down_proj(x))
+#         return up_proj
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -311,7 +314,8 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.routing = layer_idx in config.routing_layers
         if self.routing:
             self.router = LlamaRouter(config)
-            self.router_proj = LlamaProj(config)
+            self.mlp_quantized = copy.deepcopy(self.mlp)
+            quantize_(self.mlp_quantized, int8_weight_only())
 
     def forward(
         self,
@@ -357,9 +361,13 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.routing:
-            preserved_hidden_states = self.mlp(hidden_states) * router_mask * router_weights
-            skipped_hidden_states = self.router_proj(hidden_states) * (1-router_mask) * (1-router_weights)
-            hidden_states = residual + preserved_hidden_states + skipped_hidden_states
+            mlp_fp = self.mlp(hidden_states)
+                # Quantized path (router_mask = 0)
+            mlp_quant = self.mlp_quantized(hidden_states)
+                # Binary selection based on router mask
+            mlp_output = router_mask * mlp_fp + (1 - router_mask) * mlp_quant
+                
+            hidden_states = residual + mlp_output
             router_weights = router_weights.squeeze(-1)
             router_mask = router_mask.squeeze(-1)
         else:
