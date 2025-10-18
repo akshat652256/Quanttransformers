@@ -315,7 +315,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         if self.routing:
             self.router = LlamaRouter(config)
             self.mlp_quantized = copy.deepcopy(self.mlp)
-            quantize_(self.mlp_quantized, int8_weight_only())
+            
 
     def forward(
         self,
